@@ -1,0 +1,5 @@
+# macOS cruft
+.DS_Store
+
+# generated wallpaper outputs, if the tool is ever run inside the repo
+/out/

@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+#
+# adaptivize-wallpaper
+#
+# Take a directory containing two images (one with "dark" or "night" in the
+# filename, one without) and produce both:
+#   - a macOS HEIC adaptive wallpaper (light/dark)
+#   - a KDE Plasma wallpaper package (folder + metadata.json)
+#
+# Outputs are collected under a shared "out/" directory next to the inputs,
+# so they are easy to bulk-copy:
+#   out/macos/<name>.heic
+#   out/kde/<name>/         (metadata.json + contents/)
+#
+# Deps: libheif (heif-enc), exiv2, imagemagick (identify), python3
+#
+# Usage:
+#   adaptivize-wallpaper [--force] [<directory> ...]
+#
+#   With one or more directories: build each of them.
+#   With no directories:          build every wallpaper dir in the current
+#                                 directory (all subdirs except "out"),
+#                                 skipping ones already built.
+#   --force / -f:                 in no-arg mode, rebuild even if already done.
+
+set -euo pipefail
+
+# === Helpers =====================================================
+
+# Where the shared "out/" tree lives for a given input dir: a sibling "out".
+out_base_for() {
+    local dir=${1%/}
+    echo "$(dirname "$dir")/out"
+}
+
+# A wallpaper counts as "done" when both outputs are present.
+is_done() {
+    local dir=${1%/}
+    local name out_base
+    name=$(basename "$dir")
+    out_base=$(out_base_for "$dir")
+    [ -f "$out_base/macos/$name.heic" ] && [ -f "$out_base/kde/$name/metadata.json" ]
+}
+
+# === Build one wallpaper directory ===============================
+# Runs the whole light/dark -> HEIC + KDE pipeline for a single input dir.
+# Returns non-zero on any error; callers isolate it in a subshell so one bad
+# directory never aborts a batch run.
+build_one() {
+    local input_dir=${1%/}
+    local name out_base
+    name=$(basename "$input_dir")
+    out_base=$(out_base_for "$input_dir")
+
+    if [ ! -d "$input_dir" ]; then
+        echo "Error: '$input_dir' is not a directory" >&2
+        return 1
+    fi
+
+    # --- Locate input images -------------------------------------
+    local images light_img dark_img img base
+    shopt -s nullglob nocaseglob
+    images=("$input_dir"/*.{png,jpg,jpeg,tif,tiff})
+    shopt -u nullglob nocaseglob
+
+    light_img=""
+    dark_img=""
+    shopt -s nocasematch
+    for img in "${images[@]}"; do
+        base="$(basename "$img")"
+        if [[ "$base" == *dark* || "$base" == *night* ]]; then
+            if [ -n "$dark_img" ]; then
+                echo "Error [$name]: multiple images contain 'dark'/'night': $dark_img, $img" >&2
+                shopt -u nocasematch
+                return 1
+            fi
+            dark_img="$img"
+        else
+            if [ -n "$light_img" ]; then
+                echo "Error [$name]: multiple images without 'dark'/'night': $light_img, $img" >&2
+                shopt -u nocasematch
+                return 1
+            fi
+            light_img="$img"
+        fi
+    done
+    shopt -u nocasematch
+
+    if [ -z "$light_img" ] || [ -z "$dark_img" ]; then
+        echo "Error [$name]: need one image with 'dark'/'night' in the name and one without." >&2
+        echo "  Found light='${light_img:-<none>}' dark='${dark_img:-<none>}'" >&2
+        return 1
+    fi
+
+    echo "Wallpaper name: $name"
+    echo "  Light: $light_img"
+    echo "  Dark:  $dark_img"
+
+    local light_ext="${light_img##*.}"
+    local dark_ext="${dark_img##*.}"
+
+    # --- Build macOS HEIC ----------------------------------------
+    echo
+    echo "==> macOS HEIC"
+
+    local work_dir
+    work_dir="$(mktemp -d)"
+    trap 'rm -rf "$work_dir"' EXIT
+
+    cp "$light_img" "$work_dir/light.${light_ext}"
+    cp "$dark_img"  "$work_dir/dark.${dark_ext}"
+
+    # Build the binary plist {"l": 0, "d": 1} and base64 it.
+    # l = index of light image, d = index of dark image. Light goes first into
+    # heif-enc, so it becomes item 0 (the primary); dark becomes item 1.
+    local plist_b64
+    plist_b64=$(python3 -c '
+import plistlib, base64
+data = {"l": 0, "d": 1}
+print(base64.b64encode(plistlib.dumps(data, fmt=plistlib.FMT_BINARY)).decode())
+')
+
+    # XMP sidecar with the same basename as the light image. exiv2 -i X reads
+    # this sidecar and embeds it into the image.
+    local bom=$'\xef\xbb\xbf'
+    cat > "$work_dir/light.xmp" <<EOF
+<?xpacket begin="${bom}" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description xmlns:apple_desktop="http://ns.apple.com/namespace/1.0/"
+                     apple_desktop:apr="${plist_b64}"/>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>
+EOF
+
+    # Embed the XMP into the light image; heif-enc carries it through to the
+    # resulting HEIC's primary item.
+    exiv2 -i X "$work_dir/light.${light_ext}"
+
+    local macos_dir="$out_base/macos"
+    mkdir -p "$macos_dir"
+    local heic_out="$macos_dir/${name}.heic"
+    heif-enc -q 90 -o "$heic_out" \
+        "$work_dir/light.${light_ext}" \
+        "$work_dir/dark.${dark_ext}"
+
+    echo "    Wrote $heic_out"
+
+    # --- Build KDE wallpaper package -----------------------------
+    echo
+    echo "==> KDE wallpaper package"
+
+    local light_dim dark_dim
+    light_dim=$(identify -format "%wx%h" "$light_img")
+    dark_dim=$(identify -format "%wx%h" "$dark_img")
+
+    local kde_dir="$out_base/kde/$name"
+    # Rebuild cleanly so a re-run never leaves a stale image at an old size.
+    rm -rf "$kde_dir"
+    mkdir -p "$kde_dir/contents/images" "$kde_dir/contents/images_dark"
+
+    cp "$light_img" "$kde_dir/contents/images/${light_dim}.${light_ext}"
+    cp "$dark_img"  "$kde_dir/contents/images_dark/${dark_dim}.${dark_ext}"
+
+    cat > "$kde_dir/metadata.json" <<EOF
+{
+    "KPackageStructure": "Plasma/Wallpaper/Images",
+    "KPlugin": {
+        "Id": "${name}",
+        "Name": "${name}",
+        "License": "CC-BY-SA-4.0"
+    },
+    "X-KDE-CrossFade": true
+}
+EOF
+
+    echo "    Wrote $kde_dir/"
+    echo "      ├── metadata.json"
+    echo "      └── contents/"
+    echo "          ├── images/${light_dim}.${light_ext}"
+    echo "          └── images_dark/${dark_dim}.${dark_ext}"
+
+    rm -rf "$work_dir"
+    trap - EXIT
+    return 0
+}
+
+# Run build_one for one dir in an isolated subshell so a failure (or its
+# set -e abort) is contained: it never kills a batch run.
+run_one() {
+    local dir=$1 rc
+    set +e
+    ( set -e; build_one "$dir" )
+    rc=$?
+    set -e
+    return "$rc"
+}
+
+# === Dependency check ============================================
+for cmd in heif-enc exiv2 identify python3; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Error: required tool '$cmd' not found in PATH" >&2
+        exit 1
+    fi
+done
+
+# === Argument handling ===========================================
+FORCE=0
+DIRS=()
+for arg in "$@"; do
+    case "$arg" in
+        -f|--force) FORCE=1 ;;
+        -h|--help)
+            grep '^#' "$0" | sed 's/^# \{0,1\}//; 1d'
+            exit 0
+            ;;
+        -*)
+            echo "Error: unknown option '$arg'" >&2
+            exit 1
+            ;;
+        *) DIRS+=("$arg") ;;
+    esac
+done
+
+BATCH=0
+if [ ${#DIRS[@]} -eq 0 ]; then
+    # No directories given: process every wallpaper dir in the CWD except "out".
+    BATCH=1
+    shopt -s nullglob
+    for d in */; do
+        d=${d%/}
+        case "$d" in
+            out) continue ;;   # our own output tree
+            .*)  continue ;;   # hidden dirs (.claude, ...)
+        esac
+        DIRS+=("$d")
+    done
+    shopt -u nullglob
+
+    if [ ${#DIRS[@]} -eq 0 ]; then
+        echo "No wallpaper directories found in $(pwd)." >&2
+        exit 1
+    fi
+fi
+
+# === Drive the build(s) ==========================================
+built=0
+skipped=0
+FAILED=()
+
+for dir in "${DIRS[@]}"; do
+    name=$(basename "${dir%/}")
+
+    if [ "$BATCH" -eq 1 ] && [ "$FORCE" -eq 0 ] && is_done "$dir"; then
+        echo "== $name: already built, skipping (use --force to rebuild)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    echo "== $name"
+    if run_one "$dir"; then
+        built=$((built + 1))
+    else
+        echo "!! Failed to build '$name'; continuing." >&2
+        FAILED+=("$name")
+    fi
+    echo
+done
+
+# === Summary =====================================================
+echo "Done. Built $built, skipped $skipped, failed ${#FAILED[@]}."
+if [ ${#FAILED[@]} -gt 0 ]; then
+    printf '  failed: %s\n' "${FAILED[*]}" >&2
+fi
+
+echo
+echo "Outputs:"
+echo "  macOS HEICs:   out/macos/"
+echo "  KDE packages:  out/kde/"
+echo
+echo "Bulk-install the KDE packages with:"
+echo "  cp -r out/kde/* ~/.local/share/wallpapers/"
+
+if [ ${#FAILED[@]} -gt 0 ]; then
+    exit 1
+fi
