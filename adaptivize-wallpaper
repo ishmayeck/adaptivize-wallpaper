@@ -15,21 +15,29 @@
 # Deps: libheif (heif-enc), exiv2, imagemagick (identify), python3
 #
 # Usage:
-#   adaptivize-wallpaper [--force] [<directory> ...]
+#   adaptivize-wallpaper [--force] [--out <dir>] [<directory> ...]
 #
 #   With one or more directories: build each of them.
 #   With no directories:          build every wallpaper dir in the current
 #                                 directory (all subdirs except "out"),
 #                                 skipping ones already built.
 #   --force / -f:                 in no-arg mode, rebuild even if already done.
+#   --out / -o <dir>:             write outputs under <dir> instead of the
+#                                 default sibling "out/" next to the inputs.
 
 set -euo pipefail
 
 # === Helpers =====================================================
 
-# Where the shared "out/" tree lives for a given input dir: a sibling "out".
+# Where the shared "out/" tree lives for a given input dir: a sibling "out",
+# unless the user overrode it with --out/-o (OUT_OVERRIDE), which wins for all
+# inputs.
 out_base_for() {
     local dir=${1%/}
+    if [ -n "${OUT_OVERRIDE:-}" ]; then
+        echo "${OUT_OVERRIDE%/}"
+        return
+    fi
     echo "$(dirname "$dir")/out"
 }
 
@@ -207,20 +215,31 @@ done
 
 # === Argument handling ===========================================
 FORCE=0
+OUT_OVERRIDE=""
 DIRS=()
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         -f|--force) FORCE=1 ;;
+        -o|--out)
+            if [ $# -lt 2 ]; then
+                echo "Error: '$1' requires a directory argument" >&2
+                exit 1
+            fi
+            OUT_OVERRIDE=$2
+            shift
+            ;;
+        -o=*|--out=*) OUT_OVERRIDE=${1#*=} ;;
         -h|--help)
             grep '^#' "$0" | sed 's/^# \{0,1\}//; 1d'
             exit 0
             ;;
         -*)
-            echo "Error: unknown option '$arg'" >&2
+            echo "Error: unknown option '$1'" >&2
             exit 1
             ;;
-        *) DIRS+=("$arg") ;;
+        *) DIRS+=("$1") ;;
     esac
+    shift
 done
 
 BATCH=0
@@ -228,12 +247,22 @@ if [ ${#DIRS[@]} -eq 0 ]; then
     # No directories given: process every wallpaper dir in the CWD except "out".
     BATCH=1
     shopt -s nullglob
+    # Don't treat the output tree as an input: skip the default "out" and, if
+    # --out points inside the CWD, skip the top-level dir it lives under (so a
+    # nested override like "renders/wp" excludes "renders"). Absolute paths
+    # start with "/" and never appear in the "*/" glob, so they need no guard.
+    ovr_top=""
+    if [ -n "$OUT_OVERRIDE" ]; then
+        ovr_top=${OUT_OVERRIDE#./}   # drop a leading ./
+        ovr_top=${ovr_top%%/*}       # keep the first path component
+    fi
     for d in */; do
         d=${d%/}
         case "$d" in
             out) continue ;;   # our own output tree
             .*)  continue ;;   # hidden dirs (.claude, ...)
         esac
+        [ -n "$ovr_top" ] && [ "$d" = "$ovr_top" ] && continue
         DIRS+=("$d")
     done
     shopt -u nullglob
@@ -274,13 +303,15 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     printf '  failed: %s\n' "${FAILED[*]}" >&2
 fi
 
+out_display=${OUT_OVERRIDE:-out}
+out_display=${out_display%/}
 echo
 echo "Outputs:"
-echo "  macOS HEICs:   out/macos/"
-echo "  KDE packages:  out/kde/"
+echo "  macOS HEICs:   $out_display/macos/"
+echo "  KDE packages:  $out_display/kde/"
 echo
 echo "Bulk-install the KDE packages with:"
-echo "  cp -r out/kde/* ~/.local/share/wallpapers/"
+echo "  cp -r $out_display/kde/* ~/.local/share/wallpapers/"
 
 if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
