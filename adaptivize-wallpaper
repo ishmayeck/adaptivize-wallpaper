@@ -15,13 +15,19 @@
 # Deps: libheif (heif-enc), exiv2, imagemagick (identify), python3
 #
 # Usage:
-#   adaptivize-wallpaper [--force] [--out <dir>] [<directory> ...]
+#   adaptivize-wallpaper [--force] [--install] [--out <dir>] [<directory> ...]
 #
 #   With one or more directories: build each of them.
 #   With no directories:          build every wallpaper dir in the current
 #                                 directory (all subdirs except "out"),
 #                                 skipping ones already built.
 #   --force / -f:                 in no-arg mode, rebuild even if already done.
+#   --install / -i:               after the run, install the KDE package of
+#                                 every processed wallpaper (built now or
+#                                 already built) into the user wallpapers dir
+#                                 ($XDG_DATA_HOME/wallpapers). macOS has no
+#                                 equivalent location, so HEICs are not
+#                                 installed anywhere.
 #   --out / -o <dir>:             write outputs under <dir> instead of the
 #                                 default sibling "out/" next to the inputs.
 
@@ -215,11 +221,13 @@ done
 
 # === Argument handling ===========================================
 FORCE=0
+INSTALL=0
 OUT_OVERRIDE=""
 DIRS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -f|--force) FORCE=1 ;;
+        -i|--install) INSTALL=1 ;;
         -o|--out)
             if [ $# -lt 2 ]; then
                 echo "Error: '$1' requires a directory argument" >&2
@@ -277,6 +285,7 @@ fi
 built=0
 skipped=0
 FAILED=()
+INSTALL_PKGS=()   # KDE package dirs of every successfully processed wallpaper
 
 for dir in "${DIRS[@]}"; do
     name=$(basename "${dir%/}")
@@ -284,12 +293,14 @@ for dir in "${DIRS[@]}"; do
     if [ "$BATCH" -eq 1 ] && [ "$FORCE" -eq 0 ] && is_done "$dir"; then
         echo "== $name: already built, skipping (use --force to rebuild)"
         skipped=$((skipped + 1))
+        INSTALL_PKGS+=("$(out_base_for "$dir")/kde/$name")
         continue
     fi
 
     echo "== $name"
     if run_one "$dir"; then
         built=$((built + 1))
+        INSTALL_PKGS+=("$(out_base_for "$dir")/kde/$name")
     else
         echo "!! Failed to build '$name'; continuing." >&2
         FAILED+=("$name")
@@ -303,16 +314,50 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     printf '  failed: %s\n' "${FAILED[*]}" >&2
 fi
 
+# === Install the KDE packages ====================================
+# kpackagetool6's Wallpaper/Images structure has no install path (it drops
+# packages straight into ~/.local/share and can't upgrade or remove them), so
+# "install" is the documented copy into the user wallpapers dir, which Plasma
+# scans directly.
+INSTALL_FAILED=0
+if [ "$INSTALL" -eq 1 ]; then
+    echo
+    if [ "$(uname)" = "Darwin" ]; then
+        echo "--install: only KDE packages have an install location; on macOS pick"
+        echo "the HEIC in System Settings > Wallpaper instead. Nothing to do."
+    elif [ ${#INSTALL_PKGS[@]} -eq 0 ]; then
+        echo "--install: no wallpapers were processed successfully; nothing to install."
+    else
+        wallpapers_dir="${XDG_DATA_HOME:-$HOME/.local/share}/wallpapers"
+        echo "Installing KDE packages into $wallpapers_dir/"
+        mkdir -p "$wallpapers_dir"
+        for pkg in "${INSTALL_PKGS[@]}"; do
+            name=$(basename "$pkg")
+            # Replace wholesale so a reinstall never leaves a stale image
+            # behind at an old size.
+            if rm -rf "$wallpapers_dir/$name" && cp -r "$pkg" "$wallpapers_dir/$name"; then
+                echo "  + $name"
+            else
+                echo "!! Failed to install '$name'; continuing." >&2
+                INSTALL_FAILED=1
+            fi
+        done
+    fi
+fi
+
 out_display=${OUT_OVERRIDE:-out}
 out_display=${out_display%/}
 echo
 echo "Outputs:"
 echo "  macOS HEICs:   $out_display/macos/"
 echo "  KDE packages:  $out_display/kde/"
-echo
-echo "Bulk-install the KDE packages with:"
-echo "  cp -r $out_display/kde/* ~/.local/share/wallpapers/"
+if [ "$INSTALL" -eq 0 ]; then
+    echo
+    echo "Bulk-install the KDE packages with:"
+    echo "  cp -r $out_display/kde/* ~/.local/share/wallpapers/"
+    echo "or re-run with --install."
+fi
 
-if [ ${#FAILED[@]} -gt 0 ]; then
+if [ ${#FAILED[@]} -gt 0 ] || [ "$INSTALL_FAILED" -eq 1 ]; then
     exit 1
 fi

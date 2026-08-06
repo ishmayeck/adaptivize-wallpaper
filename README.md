@@ -35,6 +35,7 @@ Run it from the directory that holds your wallpaper folders.
 adaptivize-wallpaper                 # build every wallpaper dir here, skipping
                                       #   ones already built (except `out`)
 adaptivize-wallpaper --force         # rebuild everything, even if already built
+adaptivize-wallpaper --install       # also install the KDE packages (see below)
 adaptivize-wallpaper wave interfold  # build only the named dir(s)
 adaptivize-wallpaper --help          # usage
 ```
@@ -43,8 +44,17 @@ A wallpaper is considered already built when both its `out/macos/<name>.heic`
 and `out/kde/<name>/metadata.json` exist. Each directory is processed in
 isolation, so a malformed one is reported and skipped without aborting the run.
 
-Bulk-install the generated KDE packages:
+## Installing
+
+`--install` / `-i` copies the KDE package of every wallpaper the run processed
+(built now or already built) into `$XDG_DATA_HOME/wallpapers`
+(`~/.local/share/wallpapers` by default), replacing any package already there
+with the same name. That is equivalent to the manual bulk-install:
 
 ```sh
 cp -r out/kde/* ~/.local/share/wallpapers/
 ```
+
+There is no macOS equivalent: macOS has no user wallpaper directory it scans,
+so just point System Settings → Wallpaper at the generated `.heic` wherever
+you keep it.
